@@ -5,6 +5,9 @@ if(APPLE)
     list(REMOVE_ITEM files1 ${itn_files})
 endif(APPLE)
 list(REMOVE_ITEM files1 "${CMAKE_CURRENT_SOURCE_DIR}/paraformer-torch.cpp")
+# Exclude pybind11 Python extension modules - they should be built separately
+list(REMOVE_ITEM files1 "${CMAKE_CURRENT_SOURCE_DIR}/funasr_vad_online_pybind.cpp")
+list(REMOVE_ITEM files1 "${CMAKE_CURRENT_SOURCE_DIR}/funasr_vad_pybind.cpp")
 set(files ${files1})
 
 if(GPU)

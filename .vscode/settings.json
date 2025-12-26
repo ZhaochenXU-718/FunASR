@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "map": "cpp"
+    },
+    "cmake.sourceDirectory": "/Users/zhaochen.xu/GitProject/FunASR/runtime/grpc"
+}

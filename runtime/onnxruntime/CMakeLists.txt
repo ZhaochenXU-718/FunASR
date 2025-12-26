@@ -64,6 +64,8 @@ endif()
 if(ENABLE_GLOG)
     include_directories(${PROJECT_SOURCE_DIR}/third_party/glog/src)
     set(BUILD_TESTING OFF)
+    # 禁用 GTest 以避免依赖问题（我们不需要测试）
+    set(WITH_GTEST OFF CACHE BOOL "Use Google Test" FORCE)
     add_subdirectory(third_party/glog)
     include_directories(${glog_BINARY_DIR})
     

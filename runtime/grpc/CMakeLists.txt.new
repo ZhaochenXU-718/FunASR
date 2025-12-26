@@ -1,0 +1,172 @@
+# Copyright FunASR (https://github.com/alibaba-damo-academy/FunASR). All Rights
+# Reserved. MIT License  (https://opensource.org/licenses/MIT)
+#
+# 2023 by burkliu(刘柏基) liubaiji@xverse.cn
+
+cmake_minimum_required(VERSION 3.10)
+
+project(ASR C CXX)
+
+set(CMAKE_CXX_STANDARD 14 CACHE STRING "The C++ version to be used.")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_VERBOSE_MAKEFILE on)
+set(BUILD_TESTING OFF)
+
+include(common.cmake)
+
+# 添加缺失的依赖
+find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
+
+# 查找系统安装的nlohmann/json - 使用更简单的方法
+find_path(JSON_INCLUDE_DIR nlohmann/json.hpp
+  PATHS
+    /usr/include
+    /usr/local/include
+    /opt/homebrew/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../onnxruntime/third_party/nlohmann_json/include
+)
+
+if(NOT JSON_INCLUDE_DIR)
+  message(FATAL_ERROR "nlohmann/json.hpp not found. Please install nlohmann-json3-dev")
+endif()
+
+# 查找系统安装的yaml-cpp
+find_package(yaml-cpp REQUIRED)
+
+# 查找系统安装的gflags和glog
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GFLAGS REQUIRED gflags)
+pkg_check_modules(GLOG REQUIRED libglog)
+
+# 为OpenFST创建CMake目标
+add_library(gflags INTERFACE)
+target_include_directories(gflags INTERFACE ${GFLAGS_INCLUDE_DIRS})
+target_link_libraries(gflags INTERFACE ${GFLAGS_LIBRARIES})
+
+add_library(glog INTERFACE)
+target_include_directories(glog INTERFACE ${GLOG_INCLUDE_DIRS})
+target_link_libraries(glog INTERFACE ${GLOG_LIBRARIES})
+
+# 创建nlohmann_json接口目标
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json INTERFACE ${JSON_INCLUDE_DIR})
+
+# Proto file
+get_filename_component(rg_proto ../python/grpc/proto/paraformer.proto ABSOLUTE)
+get_filename_component(rg_proto_path ${rg_proto} PATH)
+
+# Generated sources
+set(rg_proto_srcs ${CMAKE_CURRENT_BINARY_DIR}/paraformer.pb.cc)
+set(rg_proto_hdrs ${CMAKE_CURRENT_BINARY_DIR}/paraformer.pb.h)
+set(rg_grpc_srcs ${CMAKE_CURRENT_BINARY_DIR}/paraformer.grpc.pb.cc)
+set(rg_grpc_hdrs ${CMAKE_CURRENT_BINARY_DIR}/paraformer.grpc.pb.h)
+
+# Include generated *.pb.h files
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
+
+link_directories(${ONNXRUNTIME_DIR}/lib)
+link_directories(${FFMPEG_DIR}/lib)
+
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/include/)
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/src/)
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/yaml-cpp/include/)
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/kaldi-native-fbank)
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/kaldi)
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/jieba/include)
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/jieba/include/limonp/include)
+
+#add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/yaml-cpp yaml-cpp)
+#add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/kaldi-native-fbank/kaldi-native-fbank/csrc csrc)
+
+# 为OpenFST添加编译定义，避免宏冲突
+add_compile_definitions(
+  FST_NO_DYNAMIC_LINKING
+  FST_USE_ABSL=0
+  GFLAGS_IS_A_DLL=0
+)
+
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/openfst)
+#add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/openfst openfst)
+
+# 为Kaldi添加FST相关的编译定义，但使用不同的方式
+# 创建一个单独的编译选项，避免与glog冲突
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DFLAGS_fst_align=1 -DFLAGS_fst_verify_properties=1 -DFLAGS_fst_error_fatal=0")
+
+# 添加kaldi (在src之前)
+#add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/kaldi kaldi)
+
+# 重要：注释掉重新编译onnxruntime源码的行
+# add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/src src)
+
+include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/glog)
+#add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/glog glog)
+
+# 创建funasr库的接口目标，使用已经编译好的库
+add_library(funasr INTERFACE)
+target_include_directories(funasr INTERFACE 
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/include
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/src
+)
+target_link_libraries(funasr INTERFACE 
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/lib/libfunasr.a
+  ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so
+  ${FFMPEG_DIR}/lib/libavcodec.so
+  ${FFMPEG_DIR}/lib/libavformat.so
+  ${FFMPEG_DIR}/lib/libavutil.so
+  ${FFMPEG_DIR}/lib/libswresample.so
+  # 使用onnxruntime编译好的库
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/openfst/src/lib/libfst.so
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/kaldi/libkaldi-util.a
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/kaldi/libkaldi-decoder.a
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/glog/libglog.so
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/gflags/libgflags.a
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/gflags/libgflags_nothreads_debug.a
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/third_party/yaml-cpp/libyaml-cpp.a
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/csrc/libkaldi-native-fbank-core.a
+  nlohmann_json
+  Threads::Threads
+)
+
+# 生成gRPC协议文件
+add_custom_command(
+  OUTPUT ${rg_proto_srcs} ${rg_proto_hdrs} ${rg_grpc_srcs} ${rg_grpc_hdrs}
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS --grpc_out ${CMAKE_CURRENT_BINARY_DIR}
+    --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
+    -I ${rg_proto_path}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
+    ${rg_proto}
+  DEPENDS ${rg_proto}
+  COMMENT "Generating gRPC protocol files"
+)
+
+# rg_grpc_proto - 使用OBJECT库避免链接问题
+add_library(rg_grpc_proto OBJECT ${rg_grpc_srcs} ${rg_grpc_hdrs} ${rg_proto_srcs} ${rg_proto_hdrs})
+
+target_link_libraries(rg_grpc_proto ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
+
+add_executable(paraformer-server paraformer-server.cc $<TARGET_OBJECTS:rg_grpc_proto>)
+target_link_libraries(paraformer-server
+  funasr
+  ${EXTRA_LIBS}
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF})
+
+add_executable(funasr-vad-server 
+  vad-server.cc 
+  vad-server.h
+  $<TARGET_OBJECTS:rg_grpc_proto>
+)
+target_link_libraries(funasr-vad-server 
+  funasr
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF}
+  glog
+  gflags
+  nlohmann_json
+  yaml-cpp
+)

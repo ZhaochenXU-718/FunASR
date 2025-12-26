@@ -91,6 +91,7 @@ class Fsmn_vad:
         waveform_nums = len(waveform_list)
         is_final = kwargs.get("kwargs", False)
         segments = [[]] * self.batch_size
+        all_segments = []
         for beg_idx in range(0, waveform_nums, self.batch_size):
             vad_scorer = E2EVadModel(self.vad_scorer_config)
             end_idx = min(waveform_nums, beg_idx + self.batch_size)
@@ -100,12 +101,14 @@ class Fsmn_vad:
             param_dict = kwargs.get("param_dict", dict())
             in_cache = param_dict.get("in_cache", list())
             in_cache = self.prepare_cache(in_cache)
+            batch_segments = [[]] * (end_idx - beg_idx)  # 只创建实际需要的数量
             try:
                 t_offset = 0
-                step = int(min(feats_len.max(), 6000))
-                for t_offset in range(0, int(feats_len), min(step, feats_len - t_offset)):
-                    if t_offset + step >= feats_len - 1:
-                        step = feats_len - t_offset
+                max_feat_len = int(feats_len.max())
+                step = int(min(max_feat_len, 6000))
+                for t_offset in range(0, max_feat_len, min(step, max_feat_len - t_offset)):
+                    if t_offset + step >= max_feat_len - 1:
+                        step = max_feat_len - t_offset
                         is_final = True
                     else:
                         is_final = False
@@ -131,15 +134,17 @@ class Fsmn_vad:
                     # segments = self.vad_scorer(scores, waveform[0][None, :], is_final=is_final, max_end_sil=self.max_end_sil)
 
                     if segments_part:
-                        for batch_num in range(0, self.batch_size):
-                            segments[batch_num] += segments_part[batch_num]
+                        for batch_num in range(0, end_idx - beg_idx):  # 只处理实际的数量
+                            batch_segments[batch_num] += segments_part[batch_num]
 
             except ONNXRuntimeError:
                 # logging.warning(traceback.format_exc())
                 logging.warning("input wav is silence or noise")
-                segments = ""
+                batch_segments = [""] * (end_idx - beg_idx)
+            
+            all_segments.extend(batch_segments)
 
-        return segments
+        return all_segments
 
     def load_data(self, wav_content: Union[str, np.ndarray, List[str]], fs: int = None) -> List:
         
@@ -149,7 +154,6 @@ class Fsmn_vad:
                 audio = AudioSegment.from_mp3(input_path)
                 audio.export(output_path, format="wav")
                 print("音频文件为mp3格式，已转换为wav格式")
-                
             except Exception as e:
                 print(f"转换失败:{e}")
 
@@ -158,10 +162,19 @@ class Fsmn_vad:
                 import os
                 input_path = path
                 path = os.path.splitext(path)[0]+'.wav'
-                convert_to_wav(input_path,path) #将mp3格式转换成wav格式
+                convert_to_wav(input_path,path)
 
             waveform, _ = librosa.load(path, sr=fs)
             return waveform
+
+        def process_item(item):
+            """处理单个输入项"""
+            if isinstance(item, str):
+                return load_wav(item)
+            elif isinstance(item, np.ndarray):
+                return item
+            else:
+                raise TypeError(f"Unsupported type: {type(item)}")
 
         if isinstance(wav_content, np.ndarray):
             return [wav_content]
@@ -170,7 +183,7 @@ class Fsmn_vad:
             return [load_wav(wav_content)]
 
         if isinstance(wav_content, list):
-            return [load_wav(path) for path in wav_content]
+            return [process_item(item) for item in wav_content]
 
         raise TypeError(f"The type of {wav_content} is not in [str, np.ndarray, list]")
 

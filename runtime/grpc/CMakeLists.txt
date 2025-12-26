@@ -46,17 +46,54 @@ include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/kaldi-nativ
 
 add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/yaml-cpp yaml-cpp)
 add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/kaldi-native-fbank/kaldi-native-fbank/csrc csrc)
-add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/src src)
+#add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/src src)
 
 include_directories(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/glog)
 add_subdirectory(${PROJECT_SOURCE_DIR}/../onnxruntime/third_party/glog glog)
 
+
+# 创建funasr库的接口目标，使用已经编译好的库
+add_library(funasr INTERFACE)
+target_include_directories(funasr INTERFACE 
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/include
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/src
+)
+target_link_libraries(funasr INTERFACE 
+  ${PROJECT_SOURCE_DIR}/../onnxruntime/build/lib/libfunasr.a
+  ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so
+  ${FFMPEG_DIR}/lib/libavcodec.so
+  ${FFMPEG_DIR}/lib/libavformat.so
+  ${FFMPEG_DIR}/lib/libavutil.so
+  ${FFMPEG_DIR}/lib/libswresample.so
+  openfst/src/lib/libfst.so
+  kaldi/libkaldi-util.a
+  kaldi/libkaldi-decoder.a
+  glog
+  gflags
+  nlohmann_json::nlohmann_json
+  yaml-cpp
+  Threads::Threads
+)
+
+add_custom_command(
+  OUTPUT ${rg_proto_srcs} ${rg_proto_hdrs} ${rg_grpc_srcs} ${rg_grpc_hdrs}
+  COMMAND ${_PROTOBUF_PROTOC}
+  ARGS --grpc_out ${CMAKE_CURRENT_BINARY_DIR}
+    --cpp_out ${CMAKE_CURRENT_BINARY_DIR}
+    -I ${rg_proto_path}
+    --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN_EXECUTABLE}
+    ${rg_proto}
+  DEPENDS ${rg_proto}
+  COMMENT "Generating gRPC protocol files"
+)
+
 # rg_grpc_proto
-add_library(rg_grpc_proto ${rg_grpc_srcs} ${rg_grpc_hdrs} ${rg_proto_srcs} ${rg_proto_hdrs})
+# rg_grpc_proto - 使用OBJECT库避免链接问题
+add_library(rg_grpc_proto OBJECT ${rg_grpc_srcs} ${rg_grpc_hdrs} ${rg_proto_srcs} ${rg_proto_hdrs})
 
 target_link_libraries(rg_grpc_proto ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
 
-add_executable(paraformer-server paraformer-server.cc)
+add_executable(paraformer-server paraformer-server.cc $<TARGET_OBJECTS:rg_grpc_proto>)
 target_link_libraries(paraformer-server
   rg_grpc_proto
   funasr
