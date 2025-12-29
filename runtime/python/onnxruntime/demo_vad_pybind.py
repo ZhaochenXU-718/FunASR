@@ -491,16 +491,275 @@ def example_infer_buffer_bytes(model_dir, wav_path, sampling_rate=16000, repeat=
         traceback.print_exc()
 
 
+# 用于存储Python模型的全局字典（每个example一个模型实例）
+_python_models_cache = {}
+
+def process_folder_with_example(example_name, example_func, model_dir, folder_path, sampling_rate=16000, **kwargs):
+    """
+    通用的文件夹处理函数，支持不同的example函数
+    
+    Args:
+        example_name: example的名称（用于显示）
+        example_func: example函数，接受 (model_dir, wav_path, sampling_rate, repeat=1) 参数
+        model_dir: 模型目录路径
+        folder_path: 包含wav文件的文件夹路径
+        sampling_rate: 采样率
+        **kwargs: 传递给example_func的其他参数
+    """
+    global _python_models_cache
+    # 获取所有wav文件
+    wav_files = []
+    for ext in ['*.wav', '*.WAV']:
+        wav_files.extend(Path(folder_path).glob(ext))
+    
+    if not wav_files:
+        print(f"错误: 文件夹中没有找到wav文件: {folder_path}")
+        return None
+    
+    wav_files = sorted(wav_files)
+    print(f"\n{'='*60}")
+    print(f"{example_name} - 文件夹模式")
+    print(f"{'='*60}")
+    print(f"找到 {len(wav_files)} 个wav文件")
+    
+    timer = PerformanceTimer()
+    
+    # 初始化模型（只初始化一次）
+    model_path = {
+        "model-dir": model_dir,
+        "quantize": "false"
+    }
+    
+    try:
+        timer.start("init")
+        vad = funasr_vad.FsmnVad(model_path, thread_num=1)
+        init_time = timer.end("init")
+        print(f"✓ 模型初始化成功: {model_dir}")
+        print(f"初始化耗时: {init_time*1000:.2f} ms\n")
+    except Exception as e:
+        print(f"✗ 模型初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # 处理每个文件
+    total_audio_duration = 0.0
+    successful_files = 0
+    failed_files = 0
+    
+    print("开始处理文件...")
+    print("-" * 60)
+    
+    for idx, wav_file in enumerate(wav_files, 1):
+        wav_path = str(wav_file)
+        print(f"\n[{idx}/{len(wav_files)}] 处理: {wav_file.name}")
+        
+        try:
+            # 根据不同的example函数调用不同的处理方式
+            if example_func == example_infer_file:
+                # 从文件推理
+                timer.start("load_audio")
+                audio, sr = sf.read(wav_path)
+                audio_duration = len(audio) / sr
+                timer.end("load_audio")
+                
+                total_audio_duration += audio_duration
+                
+                timer.start("infer")
+                segments = vad.infer_file(wav_path, sampling_rate=sampling_rate)
+                infer_time = timer.end("infer")
+                
+            elif example_func == example_infer_buffer:
+                # 从numpy数组推理
+                timer.start("load_audio")
+                audio, sr = sf.read(wav_path)
+                if audio.dtype == np.float32 or audio.dtype == np.float64:
+                    audio = (audio * 32768).astype(np.int16)
+                else:
+                    audio = audio.astype(np.int16)
+                audio_duration = len(audio) / sr
+                timer.end("load_audio")
+                
+                total_audio_duration += audio_duration
+                
+                timer.start("infer")
+                segments = vad.infer_buffer(audio, sampling_rate=sampling_rate, wav_format="pcm")
+                infer_time = timer.end("infer")
+                
+            elif example_func == example_infer_buffer_newsample:
+                # 从numpy数组推理（使用load_audio）
+                timer.start("load_audio")
+                audio_float = load_audio(wav_path)
+                if audio_float.dtype == np.float32 or audio_float.dtype == np.float64:
+                    audio = (audio_float * 32768).astype(np.int16)
+                else:
+                    audio = audio_float.astype(np.int16)
+                audio_duration = len(audio) / sampling_rate
+                timer.end("load_audio")
+                
+                total_audio_duration += audio_duration
+                
+                timer.start("infer")
+                segments = vad.infer_buffer(audio, sampling_rate=sampling_rate, wav_format="pcm")
+                infer_time = timer.end("infer")
+                
+            elif example_func == example_infer_buffer_bytes:
+                # 从bytes推理
+                timer.start("load_audio")
+                with open(wav_path, "rb") as f:
+                    audio_bytes = f.read()
+                audio, sr = sf.read(wav_path)
+                audio_duration = len(audio) / sr
+                timer.end("load_audio")
+                
+                total_audio_duration += audio_duration
+                
+                timer.start("infer")
+                segments = vad.infer_buffer_bytes(audio_bytes, sampling_rate=sampling_rate, wav_format="wav")
+                infer_time = timer.end("infer")
+                
+            elif example_func == python_infer_numpy:
+                # Python实现的推理
+                from funasr_onnx import Fsmn_vad
+                # 只在第一次初始化模型（每个example函数一个模型实例）
+                cache_key = f"{example_func.__name__}_{model_dir}"
+                if cache_key not in _python_models_cache:
+                    _python_models_cache[cache_key] = Fsmn_vad(model_dir, device_id=-1, speech_noise_thres=0.85)
+                model = _python_models_cache[cache_key]
+                
+                timer.start("load_audio")
+                data = load_audio(wav_path)
+                audio_duration = len(data) / sampling_rate
+                timer.end("load_audio")
+                
+                total_audio_duration += audio_duration
+                
+                timer.start("infer")
+                result = model(data)
+                infer_time = timer.end("infer")
+                segments = result  # python版本返回的结果格式可能不同
+                
+            else:
+                raise ValueError(f"不支持的example函数: {example_func}")
+            
+            successful_files += 1
+            seg_count = len(segments) if isinstance(segments, (list, tuple)) else 0
+            print(f"  ✓ 成功 - 时长: {audio_duration:.3f}s, 推理耗时: {infer_time*1000:.2f}ms, 检测到 {seg_count} 个语音段")
+            
+        except Exception as e:
+            failed_files += 1
+            print(f"  ✗ 失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # 收集统计信息
+    total_infer_time = timer.get_total("infer")
+    total_load_time = timer.get_total("load_audio")
+    avg_infer_time = timer.get_avg("infer")
+    init_time = timer.get_total("init")
+    total_time = init_time + total_load_time + total_infer_time
+    
+    stats = {
+        "example_name": example_name,
+        "total_files": len(wav_files),
+        "successful_files": successful_files,
+        "failed_files": failed_files,
+        "total_audio_duration": total_audio_duration,
+        "init_time": init_time,
+        "total_load_time": total_load_time,
+        "total_infer_time": total_infer_time,
+        "total_time": total_time,
+        "avg_infer_time": avg_infer_time,
+        "avg_audio_duration": total_audio_duration / successful_files if successful_files > 0 else 0,
+        "avg_rtf": avg_infer_time / (total_audio_duration / successful_files) if successful_files > 0 and total_audio_duration > 0 else 0
+    }
+    
+    return stats
+
+
+def print_all_statistics(all_stats):
+    """
+    统一打印所有example的统计信息
+    
+    Args:
+        all_stats: 统计信息列表，每个元素是一个字典
+    """
+    if not all_stats:
+        return
+    
+    print("\n" + "=" * 80)
+    print("所有 Example 统计信息汇总")
+    print("=" * 80)
+    
+    # 打印表格头部
+    print(f"\n{'Example名称':<40} {'文件数':<8} {'成功':<8} {'失败':<8} {'总时长(s)':<12} {'总耗时(ms)':<12} {'平均RTF':<10}")
+    print("-" * 80)
+    
+    # 打印每个example的统计
+    for stats in all_stats:
+        if stats is None:
+            continue
+        example_name = stats["example_name"]
+        total_files = stats["total_files"]
+        successful = stats["successful_files"]
+        failed = stats["failed_files"]
+        total_audio = stats["total_audio_duration"]
+        total_time_ms = stats["total_time"] * 1000
+        avg_rtf = stats["avg_rtf"]
+        
+        print(f"{example_name:<40} {total_files:<8} {successful:<8} {failed:<8} {total_audio:<12.3f} {total_time_ms:<12.2f} {avg_rtf:<10.4f}")
+    
+    print("\n" + "=" * 80)
+    print("详细统计信息")
+    print("=" * 80)
+    
+    # 打印每个example的详细信息
+    for stats in all_stats:
+        if stats is None:
+            continue
+        
+        print(f"\n{'-'*80}")
+        print(f"{stats['example_name']} - 详细统计")
+        print(f"{'-'*80}")
+        print(f"总文件数: {stats['total_files']}")
+        print(f"成功处理: {stats['successful_files']}")
+        print(f"失败: {stats['failed_files']}")
+        print(f"总音频时长: {stats['total_audio_duration']:.3f} s")
+        
+        print(f"\n【总耗时】")
+        print(f"  初始化: {stats['init_time']*1000:.2f} ms")
+        print(f"  音频加载: {stats['total_load_time']*1000:.2f} ms")
+        print(f"  推理: {stats['total_infer_time']*1000:.2f} ms ({stats['total_infer_time']:.3f} s)")
+        print(f"  总计: {stats['total_time']*1000:.2f} ms")
+        
+        if stats['successful_files'] > 0:
+            print(f"\n【平均每个文件】")
+            print(f"  推理耗时: {stats['avg_infer_time']*1000:.2f} ms")
+            print(f"  音频时长: {stats['avg_audio_duration']:.3f} s")
+            if stats['avg_rtf'] > 0:
+                print(f"  RTF: {stats['avg_rtf']:.4f}")
+                if stats['avg_rtf'] < 1.0:
+                    print(f"  ✅ 实时性能: 可以处理 {1.0/stats['avg_rtf']:.2f}x 实时速度")
+                else:
+                    print(f"  ⚠️  处理速度: {stats['avg_rtf']:.2f}x 实时速度")
+    
+    print("\n" + "=" * 80)
+
+
 def main():
     if len(sys.argv) < 3:
-        print("用法: python demo_vad_pybind.py <model_dir> <wav_path> [sampling_rate] [repeat]")
+        print("用法: python demo_vad_pybind.py <model_dir> <wav_path_or_folder> [sampling_rate] [repeat]")
         print("\n参数:")
-        print("  model_dir:      VAD 模型目录路径")
-        print("  wav_path:       音频文件路径")
-        print("  sampling_rate:  采样率 (默认: 16000)")
-        print("  repeat:         重复推理次数，用于统计平均耗时 (默认: 1)")
+        print("  model_dir:         VAD 模型目录路径")
+        print("  wav_path_or_folder: 音频文件路径 或 包含wav文件的文件夹路径")
+        print("  sampling_rate:     采样率 (默认: 16000)")
+        print("  repeat:            重复推理次数，用于统计平均耗时 (默认: 1)")
+        print("                     注意: 当输入是文件夹时，repeat参数无效")
         print("\n示例:")
-        print("  python demo_vad_pybind.py ./model ./audio.wav 16000 10")
+        print("  单文件模式:")
+        print("    python demo_vad_pybind.py ./model ./audio.wav 16000 10")
+        print("  文件夹模式:")
+        print("    python demo_vad_pybind.py ./model ./wav_folder 16000")
         sys.exit(1)
     
     model_dir = sys.argv[1]
@@ -513,22 +772,45 @@ def main():
         sys.exit(1)
     
     if not os.path.exists(wav_path):
-        print(f"错误: 音频文件不存在: {wav_path}")
-        sys.exit(1)
-    
-    if repeat < 1:
-        print(f"错误: 重复次数必须 >= 1，当前值: {repeat}")
+        print(f"错误: 音频文件或文件夹不存在: {wav_path}")
         sys.exit(1)
     
     print("FunASR Offline VAD Python Binding 示例")
     print("=" * 60)
     
-    # 运行示例
-    #example_infer_file(model_dir, wav_path, sampling_rate, repeat=repeat)
-    example_infer_buffer(model_dir, wav_path, sampling_rate, repeat=repeat)
-    example_infer_buffer_newsample(model_dir, wav_path, sampling_rate, repeat=repeat)
-    example_infer_buffer_bytes(model_dir, wav_path, sampling_rate, repeat=repeat)
-    python_infer_numpy(model_dir, wav_path, sampling_rate, repeat=repeat)
+    # 判断是文件还是文件夹
+    if os.path.isdir(wav_path):
+        # 文件夹模式 - 运行所有example
+        print(f"检测到文件夹输入: {wav_path}")
+        print("=" * 60)
+        
+        # 收集所有example的统计信息
+        all_stats = []
+        
+        # 运行所有example的文件夹处理版本
+        all_stats.append(process_folder_with_example("示例 1: 从文件推理", example_infer_file, model_dir, wav_path, sampling_rate))
+        all_stats.append(process_folder_with_example("示例 2: 从numpy数组推理", example_infer_buffer, model_dir, wav_path, sampling_rate))
+        all_stats.append(process_folder_with_example("示例 3: 从numpy数组推理(newsample)", example_infer_buffer_newsample, model_dir, wav_path, sampling_rate))
+        all_stats.append(process_folder_with_example("示例 4: 从bytes推理", example_infer_buffer_bytes, model_dir, wav_path, sampling_rate))
+        all_stats.append(process_folder_with_example("Python实现: numpy推理", python_infer_numpy, model_dir, wav_path, sampling_rate))
+        
+        # 统一打印所有统计信息
+        print_all_statistics(all_stats)
+    else:
+        # 单文件模式（原有逻辑）
+        if repeat < 1:
+            print(f"错误: 重复次数必须 >= 1，当前值: {repeat}")
+            sys.exit(1)
+        
+        print(f"单文件模式: {wav_path}")
+        print("=" * 60)
+        
+        # 运行示例
+        #example_infer_file(model_dir, wav_path, sampling_rate, repeat=repeat)
+        example_infer_buffer(model_dir, wav_path, sampling_rate, repeat=repeat)
+        example_infer_buffer_newsample(model_dir, wav_path, sampling_rate, repeat=repeat)
+        example_infer_buffer_bytes(model_dir, wav_path, sampling_rate, repeat=repeat)
+        python_infer_numpy(model_dir, wav_path, sampling_rate, repeat=repeat)
     
     print("\n" + "=" * 60)
     print("所有示例运行完成！")
