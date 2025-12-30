@@ -13,6 +13,7 @@ import uuid
 import tempfile
 from pathlib import Path
 from typing import Optional, List
+from contextlib import asynccontextmanager
 
 import aiofiles
 import uvicorn
@@ -143,11 +144,15 @@ def load_audio(file_path):
 class VADResponse(BaseModel):
     """VAD 检测响应模型"""
     code: int
-    message: str
-    segments: List[List[int]]  # [[start_ms, end_ms], ...]
-    total_segments: int
-    audio_duration: float  # 秒
-    processing_time: float  # 秒
+    message: str = None
+    segments: List[List[int]] = None # [[start_ms, end_ms], ...]
+    total_segments: int = 0
+    audio_duration: float = 0.0 # 秒
+    processing_total_time: float = 0.0 # 秒
+    vad_infer_time: float = 0.0 # 秒
+    is_finish: bool = False
+    all_silence: bool = False
+    need_asr: bool = False 
 
 
 class HealthResponse(BaseModel):
@@ -157,41 +162,38 @@ class HealthResponse(BaseModel):
     model_dir: Optional[str] = None
 
 
-# FastAPI 应用
-app = FastAPI(
-    title="FunASR Offline VAD API",
-    description="基于 pybind11 C API 的离线 VAD 检测服务",
-    version="1.0.0"
-)
-
-
-# 注意：这里使用 on_event 是为了兼容性
-# 在 FastAPI 0.100+ 版本中，推荐使用 lifespan 上下文管理器
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化模型"""
+# Lifespan 事件处理器
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理：启动和关闭"""
+    # 启动时初始化模型
     global vad_model, temp_dir, args
-    if args is None:
-        logger.warning("参数未初始化，跳过模型加载")
-        return
-    if vad_model is None and args.model_dir:
-        logger.info(f"正在加载 VAD 模型: {args.model_dir}")
+    
+    # 多 worker 模式下，从环境变量读取参数；单进程模式下，使用全局 args
+    model_dir = os.getenv("FUNASR_VAD_MODEL_DIR") or (args.model_dir if args else None)
+    thread_num = int(os.getenv("FUNASR_VAD_THREAD_NUM", "1")) or (args.thread_num if args else 1)
+    quantize = os.getenv("FUNASR_VAD_QUANTIZE", "false").lower() == "true" or (args.quantize if args else False)
+    
+    if model_dir:
+        logger.info(f"正在加载 VAD 模型: {model_dir}")
         try:
             model_path = {
-                "model-dir": args.model_dir,
-                "quantize": "false" if not args.quantize else "true"
+                "model-dir": model_dir,
+                "quantize": "true" if quantize else "false"
             }
-            vad_model = funasr_vad.FsmnVad(model_path, thread_num=args.thread_num)
+            vad_model = funasr_vad.FsmnVad(model_path, thread_num=thread_num)
             logger.info("VAD 模型加载成功")
         except Exception as e:
             logger.error(f"VAD 模型加载失败: {e}")
+            import traceback
+            traceback.print_exc()
             raise
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时清理资源"""
-    global vad_model, temp_dir
+    else:
+        logger.warning("参数未初始化，跳过模型加载")
+    
+    yield  # 应用运行期间
+    
+    # 关闭时清理资源
     if vad_model is not None:
         vad_model = None
         logger.info("VAD 模型已释放")
@@ -204,6 +206,15 @@ async def shutdown_event():
     #         logger.info(f"临时目录已清理: {temp_dir}")
     #     except Exception as e:
     #         logger.warning(f"清理临时目录失败: {e}")
+
+
+# FastAPI 应用
+app = FastAPI(
+    title="FunASR Offline VAD API",
+    description="基于 pybind11 C API 的离线 VAD 检测服务",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 
 @app.get("/", tags=["Root"])
@@ -220,10 +231,11 @@ async def root():
 async def health_check():
     """健康检查接口"""
     global args
+    model_dir = os.getenv("FUNASR_VAD_MODEL_DIR") or (args.model_dir if args else None)
     return HealthResponse(
         status="healthy" if vad_model is not None else "unhealthy",
         model_loaded=vad_model is not None,
-        model_dir=args.model_dir if (vad_model is not None and args is not None) else None
+        model_dir=model_dir if vad_model is not None else None
     )
 
 
@@ -286,7 +298,7 @@ async def vad_detect(
                 segments=segments,
                 total_segments=len(segments),
                 audio_duration=audio_duration,
-                processing_time=processing_time
+                processing_total_time=processing_time,
             )
             
         except Exception as e:
@@ -298,6 +310,149 @@ async def vad_detect(
     except Exception as e:
         logger.error(f"处理请求时发生错误: {e}")
         raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+
+@app.post("/vad/detect_chunks", response_model=VADResponse, tags=["VAD"])
+async def detect_chunks(audio_files: List[UploadFile], sampling_rate: int = 16000, asr_max_silence_chunks=25):
+    """
+    批量 VAD 检测接口（优化版：使用并行解码）
+    
+    Args:
+        audio_files: 音频文件列表
+        sampling_rate: 采样率（默认16000）
+    """
+    import time
+    batch_start_time = time.time()
+    
+    if vad_model is None:
+        raise HTTPException(status_code=503, detail="VAD 模型未加载")
+    
+    if not audio_files:
+        raise HTTPException(status_code=400, detail="音频文件列表为空")
+    
+    logger.info(f"收到批量 VAD 检测请求: {len(audio_files)} 个文件")
+    
+    results = []
+    file_names = [f.filename for f in audio_files]
+
+    if len(audio_files) > 150:
+        logger.warning(f"chunk number is too large: {len(audio_files)} > 150")
+        return VADResponse(
+            code=0,
+            message="success",
+            segments=[],
+            total_segments=0,
+            audio_duration=0.0,
+            processing_time=0.0,
+            is_finish=True,
+        )
+    try:
+        # 步骤1: 并行解码所有音频文件
+        decode_start_time = time.time()
+        try:
+            audio_int16_list = await decode_chunks_with_resample(audio_files, sampling_rate)
+            decode_time = time.time() - decode_start_time
+            logger.info(f"并行解码完成: {len(audio_int16_list)} 个文件, 耗时: {decode_time:.3f}s")
+        except Exception as e:
+            logger.error(f"批量音频解码失败: {e}")
+            raise HTTPException(status_code=400, detail=f"批量音频解码失败: {str(e)}")
+        
+        # 步骤2: 批量进行 VAD 推理
+        chunks_status = [0] * len(audio_files)
+        infer_start_time = time.time()
+        for idx, (audio_int16, filename) in enumerate(zip(audio_int16_list, file_names)):
+            try:
+                # VAD 推理
+                segments = vad_model.infer_buffer(
+                    audio_int16,
+                    sampling_rate=sampling_rate,
+                    wav_format="pcm"
+                )
+                if len(segments) == 0:
+                    chunks_status[idx] = 1
+                else:
+                    chunks_status[idx] = 0
+                
+        
+                
+            except Exception as e:
+                # 如果某个文件处理失败，记录错误但继续处理其他文件
+                logger.error(f"处理文件 {filename} 失败: {e}")
+                results.append({
+                    "code": 1,
+                    "message": f"处理文件 {filename} 失败: {str(e)}",
+                    "filename": filename,
+                    "segments": [],
+                    "total_segments": 0,
+                    "audio_duration": 0.0,
+                    "processing_time": 0.0
+                })
+        if 1 in chunks_status:
+            if len(chunks_status) >= asr_max_silence_chunks and 1 in chunks_status[:asr_max_silence_chunks]:
+                logger.info(f'prefix {asr_max_silence_chunks} chunks are empty, return is_finish=True')
+                infer_time = time.time() - infer_start_time
+                total_time = time.time() - batch_start_time
+                return VADResponse(
+                    code=0,
+                    message="success",
+                    processing_total_time=total_time,
+                    vad_infer_time=infer_time,
+                    is_finish=True)
+            elif len(chunks_status) >= 5 and 1 in chunks_status[-5:]:
+                logger.info(f"suffix 5 chunks are empty, return is_finish=True, need_asr=True")
+                infer_time = time.time() - infer_start_time
+                total_time = time.time() - batch_start_time
+                return VADResponse(
+                    code=0,
+                    message="success",
+                    processing_total_time=total_time,
+                    vad_infer_time=infer_time,
+                    is_finish=True,
+                    need_asr=True)
+            else:
+                logger.info(f"chunks are not all empty, return is_finish=False, need_asr=True")
+                infer_time = time.time() - infer_start_time
+                total_time = time.time() - batch_start_time
+                return VADResponse(
+                    code=0,
+                    message="success",
+                    processing_total_time=total_time,
+                    vad_infer_time=infer_time,
+                    is_finish=False,
+                    need_asr=True)
+        else:
+            if len(chunks_status) >= asr_max_silence_chunks:
+                logger.info(f"all chunks are empty, chunk number: {len(chunks_status)} >= {asr_max_silence_chunks}, return all_silence=True")
+                infer_time = time.time() - infer_start_time
+                total_time = time.time() - batch_start_time
+                return VADResponse(
+                    code=0,
+                    message="success",
+                    processing_total_time=total_time,
+                    vad_infer_time=infer_time,
+                    all_silence=True,
+                ) 
+            else:
+                logger.info(f"all chunks are empty, chunk number: {len(chunks_status)} < {asr_max_silence_chunks}, return all_silence=False")
+                infer_time = time.time() - infer_start_time
+                total_time = time.time() - batch_start_time
+                return VADResponse(
+                    code=0,
+                    message="success",
+                    processing_total_time=total_time,
+                    vad_infer_time=infer_time,
+                ) 
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"批量处理请求时发生错误: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+
+
+
+    
+
+    return await decode_chunks_with_resample(audio_files, sampling_rate)
 
 
 @app.post("/vad/detect_batch", tags=["VAD"])
@@ -483,40 +638,42 @@ def main():
         temp_dir = tempfile.mkdtemp(prefix="funasr_vad_")
         logger.info(f"使用临时目录: {temp_dir}")
     
+    # 将参数保存到环境变量，以便多 worker 模式下子进程可以访问
+    os.environ["FUNASR_VAD_MODEL_DIR"] = args.model_dir
+    os.environ["FUNASR_VAD_THREAD_NUM"] = str(args.thread_num)
+    os.environ["FUNASR_VAD_QUANTIZE"] = "true" if args.quantize else "false"
+    
     logger.info("=" * 60)
     logger.info("FunASR Offline VAD FastAPI 服务")
     logger.info("=" * 60)
     logger.info(f"模型目录: {args.model_dir}")
     logger.info(f"监听地址: {args.host}:{args.port}")
     logger.info(f"线程数: {args.thread_num}")
+    logger.info(f"Workers: {args.workers}")
     logger.info(f"临时目录: {temp_dir}")
     logger.info("=" * 60)
     
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        log_level=args.log_level
-    )
+    # 当使用多个 workers 时，需要使用导入字符串而不是直接传递 app 对象
+    if args.workers > 1:
+        # 使用导入字符串方式启动多 worker
+        # 注意：每个 worker 进程都会独立加载模型
+        uvicorn.run(
+            "vad_server_fastapi:app",  # 导入字符串
+            host=args.host,
+            port=args.port,
+            workers=args.workers,
+            log_level=args.log_level
+        )
+    else:
+        # 单 worker 可以直接传递 app 对象
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level
+        )
 
 
 if __name__ == "__main__":
     main()
-    logger.info("=" * 60)
-    logger.info("FunASR Offline VAD FastAPI 服务")
-    logger.info("=" * 60)
-    logger.info(f"模型目录: {args.model_dir}")
-    logger.info(f"监听地址: {args.host}:{args.port}")
-    logger.info(f"线程数: {args.thread_num}")
-    logger.info(f"临时目录: {temp_dir}")
-    logger.info("=" * 60)
-    
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        log_level=args.log_level
-    )
 
